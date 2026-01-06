@@ -248,6 +248,76 @@ def _show_torch_cuda_info():
         print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
     print("=+=" * 10)
 
+# Biến toàn cục để giữ Model trong RAM, tránh load lại nhiều lần
+_global_malignancy_processor = None
+
+def get_model_instance(mode="3D", model_name="I3D-20251215"):
+    """
+    Hàm này đảm bảo chỉ load model 1 lần duy nhất (Singleton Pattern)
+    """
+    global _global_malignancy_processor
+    if _global_malignancy_processor is None:
+        print(f"[API] Initializing Model: {model_name} (Mode: {mode})...")
+        try:
+            _global_malignancy_processor = MalignancyProcessor(
+                mode=mode, 
+                suppress_logs=True, 
+                model_name=model_name
+            )
+            print("[API] Model loaded successfully!")
+        except Exception as e:
+            print(f"[API] Error loading model: {e}")
+            raise e
+    return _global_malignancy_processor
+
+def run_inference(image_path, coord_x, coord_y, coord_z):
+    """
+    Hàm cầu nối để App.py gọi.
+    Input: Đường dẫn ảnh, Tọa độ X, Y, Z
+    Output: (probability, label)
+    """
+    try:
+        # 1. Cấu hình Model (Đảm bảo tên folder model đúng với folder bạn đã copy)
+        # Nếu bạn dùng 2D, đổi mode="2D" và model_name="LUNA25-baseline-2D..."
+        mode = "3D" 
+        model_name = "I3D-20251215" 
+
+        # 2. Lấy instance model (đã load sẵn)
+        processor = get_model_instance(mode=mode, model_name=model_name)
+
+        # 3. Đọc ảnh từ đường dẫn file tạm mà App.py gửi sang
+        print(f"[API] Reading image from: {image_path}")
+        input_image = SimpleITK.ReadImage(image_path)
+        
+        # 4. Chuyển đổi ảnh sang Numpy (dùng hàm có sẵn trong file này)
+        numpyImage, header = itk_image_to_numpy_image(input_image)
+
+        # 5. Xử lý tọa độ
+        # API gửi X, Y, Z. Nhưng Model của bạn (trong hàm load_inputs cũ) 
+        # dùng np.flip(coords, axis=1) để đổi thành Z, Y, X.
+        # Vì vậy ta cần truyền vào mảng [z, y, x].
+        coords_zyx = [float(coord_z), float(coord_y), float(coord_x)]
+        
+        # 6. Dự đoán
+        print(f"[API] Running prediction on coords: {coords_zyx}")
+        processor.define_inputs(numpyImage, header, [coords_zyx])
+        malignancy_risk, logits = processor.predict()
+        
+        # 7. Xử lý kết quả đầu ra
+        # malignancy_risk trả về mảng, ta lấy phần tử đầu tiên
+        prob = float(np.array(malignancy_risk).reshape(-1)[0])
+        label = 1 if prob > 0.5 else 0 # Ngưỡng 0.5 để quyết định nhãn
+
+        return prob, label
+
+    except Exception as e:
+        print(f"[API] Inference Error: {e}")
+        # Ném lỗi ra để App.py bắt được
+        raise e
+    
+
+
+
 
 if __name__ == "__main__":
     mode = "3D" 

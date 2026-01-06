@@ -30,7 +30,7 @@ class Configuration(object):
         # Results
         self.EXPERIMENT_DIR = self.WORKDIR / "results"
         if not self.EXPERIMENT_DIR.exists():
-            self.EXPERIMENT_DIR.mkdir(parents=True)
+            self.EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
             
         self.EXPERIMENT_NAME = "I3D"
         self.MODE = "3D" 

@@ -1,0 +1,23 @@
+# --- PHẦN SERVER (Bắt buộc để chấm điểm) ---
+Flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+
+# --- PHẦN AI CORE (Từ dự án cũ của bạn) ---
+# Tôi đã nới lỏng phiên bản (>=) để tránh lỗi cài đặt trên Docker
+numpy>=1.22.3
+pandas>=1.4.2
+scipy>=1.8.1
+scikit-learn>=1.5.2
+torch
+torchvision
+
+# --- XỬ LÝ ẢNH Y TẾ ---
+# Ưu tiên bản mới hơn để hỗ trợ nhiều định dạng
+SimpleITK>=2.2.1
+
+# --- TIỆN ÍCH KHÁC (Giữ lại nếu code bạn có import) ---
+# Lưu ý: Code AI không nên dùng lệnh plt.show() khi chạy trên Server
+matplotlib>=3.5.2
+seaborn>=0.11.2
+tqdm

@@ -1,18 +1,14 @@
 version: '3.8'
 
 services:
-  # 1. Backend (Model AI API)
   backend:
     build: ./backend
     container_name: luna25_submission
     restart: always
     environment:
-      # Nếu code của bạn cần biến môi trường để trỏ tới model
-      MODEL_PATH: "/app/I3D-20251215/best_metric_model.pth" 
+      MODEL_PATH: "/opt/app/resources/I3D-20251215/best_metric_model.pth"
     ports:
-      - "5000:5000" # Mở port 5000 để Admin gọi vào
-    # Không cần db nếu model chỉ chạy inference (trừ khi code bạn bắt buộc kết nối DB)
-
-    # Nếu bạn muốn map thư mục để test file ảnh
+      - "5000:5000"
+    
     volumes:
-       - ./backend/uploads:/app/uploads
+       - ./backend/uploads:/opt/app/uploads

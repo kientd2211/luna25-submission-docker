@@ -1,330 +1,194 @@
-from typing import Dict, Tuple
-
-from pathlib import Path
-import json
-from glob import glob
-import SimpleITK
+import SimpleITK as sitk
 import numpy as np
-from scipy.special import logit
-import joblib
+import time
+import os
+import torch
+import cv2
 from processor import MalignancyProcessor
 
+# --- IMPORT MEDSAM ---
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+    HAS_MEDSAM = True
+except ImportError:
+    print("[AI] Warning: 'segment_anything' library not found. Skipping MedSAM.")
+    HAS_MEDSAM = False
 
-INPUT_PATH = Path("/input")
-OUTPUT_PATH = Path("/output")
-RESOURCE_PATH = Path("/opt/app/resources")
+_model_instance = None
+_medsam_predictor = None
 
-def transform(input_image, point):
-    """
-
-    Parameters
-    ----------
-    input_image: SimpleITK Image
-    point: array of points
-
-    Returns
-    -------
-    tNumpyOrigin
-
-    """
-    return np.array(
-        list(
-            reversed(
-                input_image.TransformContinuousIndexToPhysicalPoint(
-                    list(reversed(point))
-                )
-            )
+def get_model():
+    global _model_instance
+    if _model_instance is None:
+        print("[AI] Loading I3D Model...")
+        _model_instance = MalignancyProcessor(
+            mode="3D", 
+            model_name="I3D-20251215",
+            suppress_logs=True
         )
-    )
+        print("[AI] I3D Model Ready!")
+    return _model_instance
 
-def itk_image_to_numpy_image(input_image):
+def get_medsam():
+    global _medsam_predictor
+    if not HAS_MEDSAM:
+        return None
+        
+    if _medsam_predictor is None:
+        ckpt_path = "/opt/app/resources/MedSAM/medsam_vit_b.pth"
+        
+        if not os.path.exists(ckpt_path):
+            print(f"[AI] MedSAM checkpoint not found at {ckpt_path}. Skipping.")
+            return None
+            
+        print("[AI] Loading MedSAM Model...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            medsam_model = sam_model_registry["vit_b"](checkpoint=ckpt_path)
+            medsam_model.to(device)
+            medsam_model.eval()
+            _medsam_predictor = SamPredictor(medsam_model)
+            print("[AI] MedSAM Ready!")
+        except Exception as e:
+            print(f"[AI] Failed to load MedSAM: {e}")
+            return None
+        
+    return _medsam_predictor
+
+def apply_medsam_segmentation(numpy_image, center_idx, spacing):
     """
-
-    Parameters
-    ----------
-    input_image: SimpleITK image
-
-    Returns
-    -------
-    numpyImage: SimpleITK image to numpy image
-    header: dict containing origin, spacing and transform in numpy format
-
+    Dùng MedSAM để segment nốt phổi
     """
+    predictor = get_medsam()
+    if predictor is None:
+        return numpy_image 
 
-    numpyImage = SimpleITK.GetArrayFromImage(input_image)
-    numpyOrigin = np.array(list(reversed(input_image.GetOrigin())))
-    numpySpacing = np.array(list(reversed(input_image.GetSpacing())))
+    z, y, x = int(center_idx[0]), int(center_idx[1]), int(center_idx[2])
+    
+    # Check boundary
+    if z < 0 or z >= numpy_image.shape[0]:
+        return numpy_image
+        
+    # Lấy slice 2D
+    img_2d = numpy_image[z, :, :]
+    
+    # Chuẩn hóa ảnh cho MedSAM (yêu cầu 3 kênh, 0-255)
+    img_min, img_max = np.min(img_2d), np.max(img_2d)
+    if img_max - img_min > 0:
+        img_2d_norm = (img_2d - img_min) / (img_max - img_min) * 255.0
+    else:
+        img_2d_norm = img_2d
+        
+    img_2d_uint8 = img_2d_norm.astype(np.uint8)
+    img_3c = cv2.cvtColor(img_2d_uint8, cv2.COLOR_GRAY2RGB)
+    
+    # Tạo Box Prompt (40mm box)
+    box_size_mm = 40.0 
+    box_size_px_x = int(box_size_mm / spacing[2] / 2)
+    box_size_px_y = int(box_size_mm / spacing[1] / 2)
+    
+    bbox = np.array([
+        x - box_size_px_x, y - box_size_px_y, 
+        x + box_size_px_x, y + box_size_px_y 
+    ])
+    
+    try:
+        predictor.set_image(img_3c)
+        masks, _, _ = predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=bbox[None, :],
+            multimask_output=False
+        )
+        
+        mask = masks[0] 
+        
+        # Áp dụng Mask vào slice hiện tại
+        # Logic: Giữ lại phần trong mask, phần ngoài cho về giá trị thấp nhất (đen)
+        mask_binary = mask.astype(np.float32)
+        
+        # Lấy nền là giá trị min của ảnh để không bị đen tuyệt đối gây nhiễu biên
+        bg_value = np.min(numpy_image[z, :, :])
+        
+        # Apply mask: Chỗ nào mask=1 giữ nguyên, mask=0 gán bg_value
+        segmented_slice = np.where(mask_binary > 0, numpy_image[z, :, :], bg_value)
+        
+        numpy_image[z, :, :] = segmented_slice
+        print("[AI] MedSAM Segmentation applied successfully.")
+        
+    except Exception as e:
+        print(f"[AI] MedSAM Error: {e}")
+        
+    return numpy_image
 
-    # get numpyTransform
-    tNumpyOrigin = transform(input_image, np.zeros((numpyImage.ndim,)))
-    tNumpyMatrixComponents = [None] * numpyImage.ndim
-    for i in range(numpyImage.ndim):
-        v = [0] * numpyImage.ndim
-        v[i] = 1
-        tNumpyMatrixComponents[i] = transform(input_image, v) - tNumpyOrigin
-    numpyTransform = np.vstack(tNumpyMatrixComponents).dot(np.diag(1 / numpySpacing))
-
-    # define necessary image metadata in header
-    header = {
-        "origin": numpyOrigin,
-        "spacing": numpySpacing,
-        "transform": numpyTransform,
+def run_patient_inference(image_path, series_uid, candidates):
+    model = get_model()
+    
+    print(f"[AI] Reading Image: {image_path}")
+    image = sitk.ReadImage(image_path)
+    
+    numpyImage = sitk.GetArrayFromImage(image)
+    
+    spacing_sitk = image.GetSpacing()
+    spacing_numpy = np.array(list(reversed(spacing_sitk)))
+    
+    # --- SỬA LỖI QUAN TRỌNG: DÙNG MA TRẬN 3x3 ---
+    # Để khớp với vector đầu vào 3 chiều [z, y, x]
+    header_bypass = {
+        "origin": np.array([0.0, 0.0, 0.0]), 
+        "spacing": spacing_numpy,            
+        "transform": np.eye(3) # Fix: Dùng 3x3 thay vì 4x4
     }
 
-    return numpyImage, header
-
-
-class NoduleProcessor:
-    def __init__(self, ct_image_file, nodule_locations, clinical_information, mode="2D", model_name="LUNA25-baseline-2D"):
-        """
-        Parameters
-        ----------
-        ct_image_file: Path to the CT image file
-        nodule_locations: Dictionary containing nodule coordinates and annotationIDs
-        clinical_information: Dictionary containing clinical information (Age and Gender)
-        mode: 2D or 3D
-        model_name: Name of the model to be used for prediction
-        """
-        self._image_file = ct_image_file
-        self.nodule_locations = nodule_locations
-        self.clinical_information =clinical_information
-        self.mode = mode
-        self.model_name = model_name
-
-        self.processor = MalignancyProcessor(mode=mode, suppress_logs=True, model_name=model_name)
-
-
-    def predict(self, input_image: SimpleITK.Image, coords: np.array) -> Dict:
-        """
-
-        Parameters
-        ----------
-        input_image: SimpleITK Image
-        coords: numpy array with list of nodule coordinates in /input/nodule-locations.json
-
-        Returns
-        -------
-        malignancy risk of the nodules provided in /input/nodule-locations.json
-        """
-
-        numpyImage, header = itk_image_to_numpy_image(input_image)
-
-        malignancy_risks = []
-        for i in range(len(coords)):
-            self.processor.define_inputs(numpyImage, header, [coords[i]])
-            malignancy_risk, logits = self.processor.predict()
-            malignancy_risk = np.array(malignancy_risk).reshape(-1)[0]
-            malignancy_risks.append(malignancy_risk)
-
-        malignancy_risks = np.array(malignancy_risks)
-
-
-        malignancy_risks = list(malignancy_risks)
-
-        return malignancy_risks
-
-    def load_inputs(self):
-        # load image
-        print(f"Reading {self._image_file}")
-        image = SimpleITK.ReadImage(str(self._image_file))
-
-        self.annotationIDs = [p["name"] for p in self.nodule_locations["points"]]
-        self.coords = np.array([p["point"] for p in self.nodule_locations["points"]])
-        self.coords = np.flip(self.coords, axis=1)  # reverse to [z, y, x] format
-
-        return image, self.coords, self.annotationIDs
-
-    def process(self):
-        """
-        Load CT scan(s) and nodule coordinates, predict malignancy risk and write the outputs
-        Returns
-        -------
-        None
-        """
-        image, coords, annotationIDs = self.load_inputs()
-        output = self.predict(image, coords)
-
-        assert len(output) == len(annotationIDs), "Number of outputs should match number of inputs"
-        results = {
-            "name": "Points of interest",
-            "type": "Multiple points",
-            "points": [],
-            "version": {
-                "major": 1,
-                "minor": 0
-            }
-        }
-
-        # Populate the "points" section dynamically
-        coords = np.flip(coords, axis=1)
-        for i in range(len(annotationIDs)):
-            results["points"].append(
-                    {
-                    "name": annotationIDs[i],
-                    "point": coords[i].tolist(),
-                    "probability": float(output[i])
-                    }
-                )
-        return results
-
-
-def run(mode="2D", model_name="LUNA25-baseline-2D"):
-    # Read the inputs
-    input_nodule_locations = load_json_file(
-        location=INPUT_PATH / "nodule-locations.json",
-    )
-    input_clinical_information = load_json_file(
-        location=INPUT_PATH / "clinical-information-lung-ct.json",
-    )
-    input_chest_ct = load_image_path(
-        location=INPUT_PATH / "images/chest-ct",
-    )
-    # # Read a resource file: the model weights
-    # with open(RESOURCE_PATH / "some_resource.txt", "r") as f:
-    #     print(f.read())
+    results = []
     
-    # Validate access to GPU
-    _show_torch_cuda_info()
-    
-    # Run your algorithm here
-    processor = NoduleProcessor(ct_image_file=input_chest_ct,
-                                nodule_locations=input_nodule_locations,
-                                clinical_information=input_clinical_information,
-                                mode=mode,
-                                model_name=model_name)
-    malignancy_risks = processor.process()
-
-    # Save your output
-    write_json_file(
-        location=OUTPUT_PATH / "lung-nodule-malginancy-likelihoods.json",
-        content=malignancy_risks,
-    )
-    print(f"Completed writing output to {OUTPUT_PATH}")
-    print(f"Output: {malignancy_risks}") 
-    return 0
-
-
-def load_json_file(*, location):
-    # Reads a json file
-    with open(location, "r") as f:
-        return json.loads(f.read())
-
-
-def write_json_file(*, location, content):
-    # Writes a json file
-    with open(location, "w") as f:
-        f.write(json.dumps(content, indent=4))
-
-
-def load_image_path(*, location):
-    # Use SimpleITK to read a file
-    input_files = (
-        glob(str(location / "*.tif"))
-        + glob(str(location / "*.tiff"))
-        + glob(str(location / "*.mha"))
-    )
-
-    assert (
-                len(input_files) == 1
-            ), "Please upload only one .mha file per job for grand-challenge.org"
-    
-    result = input_files[0]
-
-    
-
-    return result
-
-
-def _show_torch_cuda_info():
-    import torch
-
-    print("=+=" * 10)
-    print("Collecting Torch CUDA information")
-    print(f"Torch version: {torch.version.cuda}")
-    print(f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
-    if available:
-        print(f"\tnumber of devices: {torch.cuda.device_count()}")
-        print(f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
-        print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
-    print("=+=" * 10)
-
-# Biến toàn cục để giữ Model trong RAM, tránh load lại nhiều lần
-_global_malignancy_processor = None
-
-def get_model_instance(mode="3D", model_name="I3D-20251215"):
-    """
-    Hàm này đảm bảo chỉ load model 1 lần duy nhất (Singleton Pattern)
-    """
-    global _global_malignancy_processor
-    if _global_malignancy_processor is None:
-        print(f"[API] Initializing Model: {model_name} (Mode: {mode})...")
+    for i, cand in enumerate(candidates):
+        start_t = time.time()
+        
+        cx = float(cand.get("CoordX", cand.get("x", 0)))
+        cy = float(cand.get("CoordY", cand.get("y", 0)))
+        cz = float(cand.get("CoordZ", cand.get("z", 0)))
+        c_id = cand.get("seriesInstanceUID", str(i + 1)) 
+        
+        prob = 0.0
         try:
-            _global_malignancy_processor = MalignancyProcessor(
-                mode=mode, 
-                suppress_logs=True, 
-                model_name=model_name
-            )
-            print("[API] Model loaded successfully!")
+            # 1. Tính toán tọa độ Voxel
+            idx_x, idx_y, idx_z = image.TransformPhysicalPointToIndex((cx, cy, cz))
+            center_idx = [idx_z, idx_y, idx_x] 
+            
+            # 2. SEGMENTATION (MedSAM)
+            # Copy ảnh để xử lý riêng cho nốt này
+            # (Quan trọng: Không sửa trực tiếp lên numpyImage gốc vì sẽ ảnh hưởng nốt sau)
+            input_image_for_model = numpyImage.copy()
+            input_image_for_model = apply_medsam_segmentation(input_image_for_model, center_idx, spacing_numpy)
+            
+            # 3. CLASSIFICATION (I3D)
+            # Tính tọa độ input bypass
+            input_z = idx_z * spacing_numpy[0]
+            input_y = idx_y * spacing_numpy[1]
+            input_x = idx_x * spacing_numpy[2]
+            
+            coords_bypass = np.array([input_z, input_y, input_x])
+            
+            # Đưa ảnh ĐÃ SEGMENT vào model phân loại
+            model.define_inputs(input_image_for_model, header_bypass, [coords_bypass])
+            prob_arr, _ = model.predict()
+            
+            if isinstance(prob_arr, (list, np.ndarray)) and len(prob_arr) > 0:
+                prob = float(np.array(prob_arr).reshape(-1)[0])
+            
         except Exception as e:
-            print(f"[API] Error loading model: {e}")
-            raise e
-    return _global_malignancy_processor
+            print(f"[AI] Error processing nodule {c_id}: {e}")
+            prob = 0.0
 
-def run_inference(image_path, coord_x, coord_y, coord_z):
-    """
-    Hàm cầu nối để App.py gọi.
-    Input: Đường dẫn ảnh, Tọa độ X, Y, Z
-    Output: (probability, label)
-    """
-    try:
-        # 1. Cấu hình Model (Đảm bảo tên folder model đúng với folder bạn đã copy)
-        # Nếu bạn dùng 2D, đổi mode="2D" và model_name="LUNA25-baseline-2D..."
-        mode = "3D" 
-        model_name = "I3D-20251215" 
-
-        # 2. Lấy instance model (đã load sẵn)
-        processor = get_model_instance(mode=mode, model_name=model_name)
-
-        # 3. Đọc ảnh từ đường dẫn file tạm mà App.py gửi sang
-        print(f"[API] Reading image from: {image_path}")
-        input_image = SimpleITK.ReadImage(image_path)
+        proc_time = int((time.time() - start_t) * 1000)
         
-        # 4. Chuyển đổi ảnh sang Numpy (dùng hàm có sẵn trong file này)
-        numpyImage, header = itk_image_to_numpy_image(input_image)
-
-        # 5. Xử lý tọa độ
-        # API gửi X, Y, Z. Nhưng Model của bạn (trong hàm load_inputs cũ) 
-        # dùng np.flip(coords, axis=1) để đổi thành Z, Y, X.
-        # Vì vậy ta cần truyền vào mảng [z, y, x].
-        coords_zyx = [float(coord_z), float(coord_y), float(coord_x)]
+        results.append({
+            "seriesInstanceUID": str(c_id),
+            "probability": prob,
+            "predictionLabel": 1 if prob > 0.5 else 0,
+            "processingTimeMs": proc_time,
+            "CoordX": cx, "CoordY": cy, "CoordZ": cz
+        })
         
-        # 6. Dự đoán
-        print(f"[API] Running prediction on coords: {coords_zyx}")
-        processor.define_inputs(numpyImage, header, [coords_zyx])
-        malignancy_risk, logits = processor.predict()
-        
-        # 7. Xử lý kết quả đầu ra
-        # malignancy_risk trả về mảng, ta lấy phần tử đầu tiên
-        prob = float(np.array(malignancy_risk).reshape(-1)[0])
-        label = 1 if prob > 0.5 else 0 # Ngưỡng 0.5 để quyết định nhãn
-
-        return prob, label
-
-    except Exception as e:
-        print(f"[API] Inference Error: {e}")
-        # Ném lỗi ra để App.py bắt được
-        raise e
-    
-
-
-
-
-if __name__ == "__main__":
-    mode = "3D" 
-    model_name = "I3D-20251215" # Phải trùng tên thư mục bạn COPY trong Dockerfile
-    
-    # Nếu dùng 2D (như code cũ):
-    # mode = "2D"
-    # model_name = "LUNA25-baseline-2D-20250225"
-
-    raise SystemExit(run(mode=mode, model_name=model_name))
+    return results

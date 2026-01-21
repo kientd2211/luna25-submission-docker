@@ -1,8 +1,36 @@
+# --- Python & Environment ---
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+venv/
+env/
+
+# --- IDE Settings ---
 .vscode/
 .idea/
-submission.tar
-test/
+
+# --- Dữ liệu Y tế & Ảnh (TUYỆT ĐỐI KHÔNG PUSH) ---
+*.dcm
+*.mha
+*.nii
+*.nii.gz
+output_mha/
+backend/uploads/
 output/
+
+# --- Model Weights (File nặng > 100MB sẽ bị lỗi Push) ---
+*.pth
+*.pt
+*.pkl
+*.h5
+backend/resources/MedSAM/
+backend/I3D-20251215/
+
+# --- Docker & Build Artifacts ---
+*.tar
+submission_luna25.tar
+submission.tar
+
+# --- Secrets ---
+.env
